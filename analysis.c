@@ -6,27 +6,61 @@
 #include <mpi.h>
 
 #define GRID_SIZE 0.01
+#define EARTH_RADIUS_KM 6371.0
 
-// U.S. bounding box
 const double min_lat = 24.396308;
 const double max_lat = 49.384358;
 const double min_long = -125.000000;
 const double max_long = -66.934570;
 
-void lat_long_to_grid(const double *latitudes, const double *longitudes, int *lat_grid, int *long_grid, int size) {
+// SIMD-accelerated coordinate conversion
+void lat_long_to_grid_simd(const double *latitudes, const double *longitudes, int *lat_grid, int *long_grid, int size) {
+    __m256d minLat = _mm256_set1_pd(min_lat);
+    __m256d minLong = _mm256_set1_pd(min_long);
+    __m256d cellSize = _mm256_set1_pd(GRID_SIZE);
+
     #pragma omp parallel for
-    for (int i = 0; i < size; i++) {
-        lat_grid[i] = (int)floor((latitudes[i] - min_lat) / GRID_SIZE);
-        long_grid[i] = (int)floor((longitudes[i] - min_long) / GRID_SIZE);
+    for (int i = 0; i < size; i += 4) {
+        __m256d lat = _mm256_loadu_pd(&latitudes[i]);
+        __m256d lon = _mm256_loadu_pd(&longitudes[i]);
+
+        __m256d latIndex = _mm256_div_pd(_mm256_sub_pd(lat, minLat), cellSize);
+        __m256d lonIndex = _mm256_div_pd(_mm256_sub_pd(lon, minLong), cellSize);
+
+        double latIdx[4], lonIdx[4];
+        _mm256_storeu_pd(latIdx, latIndex);
+        _mm256_storeu_pd(lonIdx, lonIndex);
+
+        for (int j = 0; j < 4 && (i + j) < size; j++) {
+            lat_grid[i + j] = (int)latIdx[j];
+            long_grid[i + j] = (int)lonIdx[j];
+        }
     }
 }
 
-void calculate_distances(const double *latitudes, const double *longitudes, float *distances, int size) {
+// SIMD-accelerated Euclidean distance
+void calculate_distances_simd(const double *lat, const double *lon, float *distances, int size) {
     #pragma omp parallel for
     for (int i = 0; i < size; i++) {
-        for (int j = 0; j < size; j++) {
-            distances[i * size + j] = sqrtf((latitudes[i] - latitudes[j]) * (latitudes[i] - latitudes[j]) +
-                                            (longitudes[i] - longitudes[j]) * (longitudes[i] - longitudes[j]));
+        __m256d lat_i = _mm256_set1_pd(lat[i]);
+        __m256d lon_i = _mm256_set1_pd(lon[i]);
+        for (int j = 0; j < size; j += 4) {
+            __m256d lat_j = _mm256_loadu_pd(&lat[j]);
+            __m256d lon_j = _mm256_loadu_pd(&lon[j]);
+
+            __m256d dlat = _mm256_sub_pd(lat_i, lat_j);
+            __m256d dlon = _mm256_sub_pd(lon_i, lon_j);
+
+            __m256d dlat2 = _mm256_mul_pd(dlat, dlat);
+            __m256d dlon2 = _mm256_mul_pd(dlon, dlon);
+            __m256d dist2 = _mm256_add_pd(dlat2, dlon2);
+            __m256d dist = _mm256_sqrt_pd(dist2);
+
+            double dist_vals[4];
+            _mm256_storeu_pd(dist_vals, dist);
+            for (int k = 0; k < 4 && (j + k) < size; k++) {
+                distances[i * size + j + k] = (float)dist_vals[k];
+            }
         }
     }
 }
@@ -34,46 +68,40 @@ void calculate_distances(const double *latitudes, const double *longitudes, floa
 int main(int argc, char *argv[]) {
     MPI_Init(&argc, &argv);
 
-    int rank, size;
+    int rank, nprocs;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    MPI_Comm_size(MPI_COMM_WORLD, &nprocs);
 
-    // Load data
-    FILE *file = fopen("/N/u/pkamburu/BigRed200/project/data/processed_twitter_data.csv", "r");
-    if (!file) {
-        fprintf(stderr, "Error opening file\n");
-        MPI_Finalize();
-        return 1;
-    }
-
-    // Read data (this is a placeholder, replace with actual data reading)
-    int data_size = 1000; // Example size
+    int data_size = 1000;
     double *latitudes = (double *)malloc(data_size * sizeof(double));
     double *longitudes = (double *)malloc(data_size * sizeof(double));
     int *lat_grid = (int *)malloc(data_size * sizeof(int));
     int *long_grid = (int *)malloc(data_size * sizeof(int));
     float *distances = (float *)malloc(data_size * data_size * sizeof(float));
 
-    // Initialize data (this is a placeholder, replace with actual data initialization)
+    if (!latitudes || !longitudes || !lat_grid || !long_grid || !distances) {
+        fprintf(stderr, "Memory allocation failed\n");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
+    // Generate synthetic test data
     for (int i = 0; i < data_size; i++) {
         latitudes[i] = min_lat + (max_lat - min_lat) * ((double)rand() / RAND_MAX);
         longitudes[i] = min_long + (max_long - min_long) * ((double)rand() / RAND_MAX);
     }
 
-    // Vectorized coordinate conversion
-    lat_long_to_grid(latitudes, longitudes, lat_grid, long_grid, data_size);
+    // Coordinate conversion using SIMD
+    lat_long_to_grid_simd(latitudes, longitudes, lat_grid, long_grid, data_size);
 
-    // AVX-accelerated distance calculations
-    calculate_distances(latitudes, longitudes, distances, data_size);
+    // Distance computation using SIMD
+    calculate_distances_simd(latitudes, longitudes, distances, data_size);
 
-    // Hybrid Parallelism: OpenMP for Temporal Analysis and MPI for Spatial Domain Decomposition
-    int chunk_size = data_size / size;
+    // Spatial domain decomposition using MPI
+    int chunk_size = data_size / nprocs;
     int start = rank * chunk_size;
-    int end = (rank == size - 1) ? data_size : (rank + 1) * chunk_size;
+    int end = (rank == nprocs - 1) ? data_size : (rank + 1) * chunk_size;
 
-    // Perform regional analysis on local data
     int *local_counts = (int *)malloc(chunk_size * sizeof(int));
-    #pragma omp parallel for
     for (int i = start; i < end; i++) {
         local_counts[i - start] = 0;
         for (int j = 0; j < data_size; j++) {
@@ -83,16 +111,18 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // Gather results from all processes
     int *global_counts = NULL;
     if (rank == 0) {
         global_counts = (int *)malloc(data_size * sizeof(int));
     }
+
     MPI_Gather(local_counts, chunk_size, MPI_INT, global_counts, chunk_size, MPI_INT, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        printf("Global counts shape: %d\n", data_size);
-        // Save processed data (this is a placeholder, replace with actual data saving)
+        printf("Global counts (first 10):\n");
+        for (int i = 0; i < 10; i++) {
+            printf("Cell %d: %d tweets\n", i, global_counts[i]);
+        }
     }
 
     free(latitudes);
@@ -101,9 +131,7 @@ int main(int argc, char *argv[]) {
     free(long_grid);
     free(distances);
     free(local_counts);
-    if (rank == 0) {
-        free(global_counts);
-    }
+    if (rank == 0) free(global_counts);
 
     MPI_Finalize();
     return 0;
