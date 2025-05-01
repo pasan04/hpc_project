@@ -38,15 +38,7 @@ int main(int argc, char *argv[]) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-    // Load data
-    FILE *file = fopen("/N/u/pkamburu/BigRed200/project/data/processed_twitter_data.csv", "r");
-    if (!file) {
-        fprintf(stderr, "Error opening file\n");
-        MPI_Finalize();
-        return 1;
-    }
-
-    // Read data (this is a placeholder, replace with actual data reading)
+    // Load data (this is a placeholder, replace with actual data loading)
     int data_size = 1000; // Example size
     double *latitudes = (double *)malloc(data_size * sizeof(double));
     double *longitudes = (double *)malloc(data_size * sizeof(double));
