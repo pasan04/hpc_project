@@ -1,102 +1,43 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <math.h>
-#include <immintrin.h>
-#include <omp.h>
-#include <mpi.h>
+import yaml
+import pandas as pd
 
-#define GRID_SIZE 0.01
+# Get the config.yml file
+with open('config.yml', 'r') as config_file:
+    config = yaml.safe_load(config_file)
 
-// U.S. bounding box
-const double min_lat = 24.396308;
-const double max_lat = 49.384358;
-const double min_long = -125.000000;
-const double max_long = -66.934570;
+data_file = config['data_file']
+processed_data_file = config['processed_data_file'] 
 
-void lat_long_to_grid(const double *latitudes, const double *longitudes, int *lat_grid, int *long_grid, int size) {
-    #pragma omp parallel for
-    for (int i = 0; i < size; i++) {
-        lat_grid[i] = (int)floor((latitudes[i] - min_lat) / GRID_SIZE);
-        long_grid[i] = (int)floor((longitudes[i] - min_long) / GRID_SIZE);
-    }
+# Get the data to dataframe
+df = pd.read_csv(data_file, encoding='latin1')
+
+print(df.head(10))
+
+# Get the U.S bounding data
+us_bounds = {
+    'min_lat': 24.396308, 'max_lat': 49.384358,
+    'min_long': -125.000000, 'max_long': -66.934570
 }
 
-void calculate_distances(const double *latitudes, const double *longitudes, float *distances, int size) {
-    #pragma omp parallel for
-    for (int i = 0; i < size; i++) {
-        for (int j = 0; j < size; j++) {
-            distances[i * size + j] = sqrtf((latitudes[i] - latitudes[j]) * (latitudes[i] - latitudes[j]) +
-                                            (longitudes[i] - longitudes[j]) * (longitudes[i] - longitudes[j]));
-        }
-    }
-}
+us_df = df[
+    (df['latitude'].between(us_bounds['min_lat'], us_bounds['max_lat'])) &
+    (df['longitude'].between(us_bounds['min_long'], us_bounds['max_long']))
+].copy()
 
-int main(int argc, char *argv[]) {
-    MPI_Init(&argc, &argv);
+# Now the data is with the US bound
+print(us_df.head(10))
 
-    int rank, size;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &size);
+# Convert timestamps to hourly/daily format
+us_df['timestamp'] = pd.to_datetime(us_df['timestamp'], errors='coerce')
+us_df['hour'] = us_df['timestamp'].dt.hour.astype('uint8')
+us_df['day'] = us_df['timestamp'].dt.dayofweek.astype('uint8')  # Monday=0, Sunday=6
+us_df['date'] = us_df['timestamp'].dt.date
 
-    // Load data (this is a placeholder, replace with actual data loading)
-    int data_size = 1000; // Example size
-    double *latitudes = (double *)malloc(data_size * sizeof(double));
-    double *longitudes = (double *)malloc(data_size * sizeof(double));
-    int *lat_grid = (int *)malloc(data_size * sizeof(int));
-    int *long_grid = (int *)malloc(data_size * sizeof(int));
-    float *distances = (float *)malloc(data_size * data_size * sizeof(float));
+us_df = us_df.drop(columns=['timestamp'])
 
-    // Initialize data (this is a placeholder, replace with actual data initialization)
-    for (int i = 0; i < data_size; i++) {
-        latitudes[i] = min_lat + (max_lat - min_lat) * ((double)rand() / RAND_MAX);
-        longitudes[i] = min_long + (max_long - min_long) * ((double)rand() / RAND_MAX);
-    }
+print(f"Filtered data shape: {us_df.shape}")
+print(us_df.head())
 
-    // Vectorized coordinate conversion
-    lat_long_to_grid(latitudes, longitudes, lat_grid, long_grid, data_size);
+# Write to a new csv file
+us_df.to_csv(processed_data_file)
 
-    // AVX-accelerated distance calculations
-    calculate_distances(latitudes, longitudes, distances, data_size);
-
-    // Hybrid Parallelism: OpenMP for Temporal Analysis and MPI for Spatial Domain Decomposition
-    int chunk_size = data_size / size;
-    int start = rank * chunk_size;
-    int end = (rank == size - 1) ? data_size : (rank + 1) * chunk_size;
-
-    // Perform regional analysis on local data
-    int *local_counts = (int *)malloc(chunk_size * sizeof(int));
-    #pragma omp parallel for
-    for (int i = start; i < end; i++) {
-        local_counts[i - start] = 0;
-        for (int j = 0; j < data_size; j++) {
-            if (lat_grid[i] == lat_grid[j] && long_grid[i] == long_grid[j]) {
-                local_counts[i - start]++;
-            }
-        }
-    }
-
-    // Gather results from all processes
-    int *global_counts = NULL;
-    if (rank == 0) {
-        global_counts = (int *)malloc(data_size * sizeof(int));
-    }
-    MPI_Gather(local_counts, chunk_size, MPI_INT, global_counts, chunk_size, MPI_INT, 0, MPI_COMM_WORLD);
-
-    if (rank == 0) {
-        printf("Global counts shape: %d\n", data_size);
-        // Save processed data (this is a placeholder, replace with actual data saving)
-    }
-
-    free(latitudes);
-    free(longitudes);
-    free(lat_grid);
-    free(long_grid);
-    free(distances);
-    free(local_counts);
-    if (rank == 0) {
-        free(global_counts);
-    }
-
-    MPI_Finalize();
-    return 0;
-}
